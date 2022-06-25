@@ -1,0 +1,9 @@
+model:
+  type: UNet
+
+training:
+  epochs: 100
+
+
+data:
+  root: "/data/munich480"
