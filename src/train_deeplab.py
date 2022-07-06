@@ -6,6 +6,8 @@ import numpy as np
 import torch.nn.functional as F
 import random
 from math import cos,pi
+from models.DeepLabV3_3D import DeepLabV3_3D
+
 from SentinelDataset import SentinelDataset
 from scipy.ndimage.filters import maximum_filter1d
 from utils.metric import ConfusionMatrix
@@ -15,44 +17,82 @@ from models.Unet3D import UNet
 from models.SegmentationLosses import SegmentationLosses
 from utils.ProgressBar import save, resume 
 import wandb
+import warnings
 
-wandb.init(project="my-test-project")
-os.environ["NCCL_DEBUG"] = "INFO"
+wandb.init(project="remote-sensing-image-segmentation")
+torch.cuda.empty_cache()
+warnings.filterwarnings("ignore")
 
 root_path = '../data/munich480'  # root dir dataset
 result_path = "../results"
 resume_path = '' #'/kaggle/input/pretrained-sentinelunet/best_model.pth'
-result_train = 'train_results.txt'
-result_validation = 'validation_results.txt'
-LABEL_FILENAME = "y.tif"
+result_train = 'train_results_V3.txt'
+result_validation = 'validation_results_V3.txt'
 
-batch_size = 8
-sample_duration = 30  # num samples temporal series
 no_of_classes = 18 #5
 workers = 8
+batch_size = 8
 h = w = 7
 n_classes = 18 #400
+LABEL_FILENAME = "y.tif"
 best_test_acc = 0
 loss = 'batch'
 ottimizzatore = 'sgd'
 learning_rate = 0.01
-weight_decay = 1e-5
+weight_decay = 1e-6
 momentum = 0.9
 loss_weights = 'store_true'
 ignore_index = 0
 test_only = False
+sample_duration = 30
 n_epochs = 100
-
 
 num_folds = 1
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 wandb.config = {
   "learning_rate": learning_rate,
-  "model": "UNet3D",
+  "model": "DeepLabV3_3D",
   "epochs": n_epochs,
   "batch_size": batch_size
 }
+
+
+print("Starting loading Dataset...")
+
+traindataset = SentinelDataset(root_path, tileids="tileids/train_fold0.tileids", seqlength=sample_duration)
+traindataloader = torch.utils.data.DataLoader(
+    traindataset, batch_size=batch_size, shuffle=True, num_workers=workers, drop_last = True)
+# How to iterate on a dataloader
+for iteration, data in enumerate(traindataloader):
+    input, target, target_ndvi, _, _ = data
+    print('input temporal series with 30 images of size 13x48x48:', input.shape)
+    print('target segmentation image (batchx48x48):', target.shape)
+    print('target_ndvi containing 30 channels of size 48x48:', target_ndvi.shape)
+    break
+
+# Load test set
+testdataset = SentinelDataset(root_path, tileids="tileids/test_fold0.tileids", seqlength=sample_duration)
+testdataloader = torch.utils.data.DataLoader(
+    testdataset, batch_size=batch_size, shuffle=False, num_workers=workers, drop_last = True)
+# Load validation set
+validationdataset = SentinelDataset(root_path, tileids="tileids/eval.tileids", seqlength=sample_duration)
+validationdataloader = torch.utils.data.DataLoader(
+    validationdataset, batch_size=batch_size, shuffle=False, num_workers=workers, drop_last = True)
+
+numclasses = len(traindataset.classes)
+labels = list(range(numclasses))
+
+
+def adjust_classes_weights(cur_epoch, curr_iter, num_iter_x_epoch, tot_epochs, start_w, descending=True):
+    current_iter = curr_iter + cur_epoch * num_iter_x_epoch
+    max_iter = tot_epochs * num_iter_x_epoch
+    # a = 0.75 - current_iter / (2 * max_iter)  # from 0.75 to 0.25
+    a = 1 - current_iter / (max_iter)  # from 0 to 1
+    if not descending:
+        a = 1 - a    # from 0.25 to 0.75
+
+    w = a * start_w + 1 - a
+    return w
 
 
 def adjust_learning_rate(cur_epoch, curr_iter, num_iter_x_epoch, tot_epochs, start_lr, lr_decay='cos'):
@@ -76,52 +116,47 @@ def adjust_learning_rate(cur_epoch, curr_iter, num_iter_x_epoch, tot_epochs, sta
     #     param_group['lr'] = lr
 
 
-def adjust_classes_weights(cur_epoch, curr_iter, num_iter_x_epoch, tot_epochs, start_w, descending=True):
-    current_iter = curr_iter + cur_epoch * num_iter_x_epoch
-    max_iter = tot_epochs * num_iter_x_epoch
-    # a = 0.75 - current_iter / (2 * max_iter)  # from 0.75 to 0.25
-    a = 1 - current_iter / (max_iter)  # from 0 to 1
-    if not descending:
-        a = 1 - a    # from 0.25 to 0.75
+def _take_channels(*xs, ignore_channels=None):
+    if ignore_channels is None:
+        return xs
+    else:
+        channels = [channel for channel in range(xs[0].shape[1]) if channel not in ignore_channels]
+        xs = [torch.index_select(x, dim=1, index=torch.tensor(channels).to(x.device)) for x in xs]
+        return xs
 
 
-def write_signatures(fcn, target, output, target_ndvi, out_ndvi, dates, patch_id, set_name):
-    # target_ndvi = torch.randint(0, nc, size=(b, s, h, w))
-    # patch_id = ('11', '12')
-    # dates = [('20200101', '20200301'), ('20200102', '20200302'), ('20200103', '20200303'), ('20200104', '20200304'),
-    #          ('20200105', '20200305')]
-    nb, nt, h, w = target_ndvi.shape
-    assert(len(dates) == nt)
-    assert(len(dates[0]) == nb)
+def _remove_index(np_matrix, ignore_index=-100):
+    if ignore_index == -100:
+        return np_matrix
+    else:
+        m = np.delete(np_matrix, ignore_index, 0) # axes=0 -> delete row index
+        m = np.delete(m, ignore_index, 1) # axes=1 -> delete col index
+        return m
 
-    # winner class for each pixel
-    winners = torch.softmax(output, dim=1).argmax(dim=1)
 
-    # bias = fcn.conv5out.bias
-    weight = fcn.conv5out.weight
+def _threshold(x, threshold=None):
+    if threshold is not None:
+        return (x > threshold).type(x.dtype)
+    else:
+        return x
 
-    for idx, patch_name in enumerate(patch_id):
-        # print('patch_name:', patch_name)
-        with open(os.path.join(result_path, set_name + '_patch_' + patch_name + ".txt"), 'w') as f:
-            f.write('class, output, type_ndvi, x, y, ')
-            f.write(', '.join(map(str, [e[idx] for e in dates])))
-            f.write("\n")
-            for y in range(0, h):
-                for x in range(0, w):
-                    target_idx = target[idx, y, x].item()
-                    output_idx = winners[idx, y, x].item()
-                    f.write('%d, %d, target, %d, %d, ' % (target_idx, output_idx, x, y))
-                    f.write(', '.join(map(str, target_ndvi[idx, :, y, x].data.tolist())))
-                    f.write("\n")
-                    f.write('%d, %d, predic, %d, %d, ' % (target_idx, output_idx, x, y))
-                    f.write(', '.join(map(str, out_ndvi[idx, :, y, x].data.tolist())))
-                    f.write("\n")
-                    f.write('%d, %d, cls_ai, output, %d, %d, ' % (target_idx, output_idx, x, y))
-                    #cai = class_activations(out_ndvi, weight, target_idx, idx, y, x)
-                    #f.write(', '.join(map(str, cai.data.tolist())))
-                    f.write("\n")
-            # f.write("\n")
-            
+
+
+def compute_train_weights(train_loader):
+    beta = 0.9
+    samples_per_cls = torch.zeros(n_classes)
+    for batch_idx, data in enumerate(train_loader):
+        inputs, targets, _, _, _ = data
+        for cls in range(n_classes):
+            samples_per_cls[cls] += torch.sum(targets == cls)
+    max_occ = torch.max(samples_per_cls)
+    weights = torch.FloatTensor(max_occ / samples_per_cls)
+    # max_occ = torch.max(weights)
+    # weights = torch.FloatTensor(weights / max_occ)
+    if torch.cuda.is_available():
+        weights = weights.cuda()
+
+    return weights
 
 
 def train_epoch(dataloader, network, optimizer, loss, ep, loss_cls, cls_weights=None):
@@ -200,7 +235,7 @@ def train_epoch(dataloader, network, optimizer, loss, ep, loss_cls, cls_weights=
             loss_measure.add(l.item())
             str_metrics += 'loss| %f | ' % loss_measure.mean
 
-            train_info = 'Train on | {} | Epoch| {} | [{}/{} ({:.0f}%)] | lr| {:.5f} | {} '.format(
+            train_info = 'Train on | {} | Epoch| {} | [{}/{} ({:.0f}%)] | lr| {:.5f} | {}    '.format(
                 dataloader.dataset.name, ep, num_processed_samples, num_train_samples,
                 100. * (iteration + 1) / len(dataloader), var_learning_rate, str_metrics)
             sys.stdout.write('\r' + train_info)
@@ -275,13 +310,9 @@ def test_epoch(dataloader, network, loss):
                 str_metrics)
             sys.stdout.write('\r' + test_info)
 
-            wandb.log({"loss": loss_measure.mean})
-        
         is_best = metrics_scalar['OA'] > best_test_acc
         best = '  **best result' if is_best else '         '
         test_info += best
-
-        
 
         sys.stdout.write('\r' + test_info + '\n')
         with open(os.path.join(result_path, result_validation), 'a+') as f:
@@ -289,7 +320,7 @@ def test_epoch(dataloader, network, loss):
 
         if is_best:
             cls_names = np.array(traindataset.classes)[conf_mat_metrics.get_labels()]
-            with open(os.path.join(result_path, "per_class_metrics.txt"), 'a+') as f:
+            with open(os.path.join(result_path, "per_class_metricsDeepLab.txt"), 'a+') as f:
                 f.write('classes:\n' + np.array2string(cls_names) + '\n')
                 for k, v in metrics_v.items():
                     f.write(k + '\n')
@@ -374,12 +405,13 @@ def test_only(dataloader, network, loss, epoch, set_name):
                 str_metrics)
             if ((100. * (iteration + 1))%100 == 0):
                 sys.stdout.write('\r' + test_info)
+            wandb.log({"loss": loss_measure.mean})
             
 
         cls_names = np.array(traindataset.classes)[conf_mat_metrics.get_labels()]
         if ((100. * (iteration + 1))%100 == 0):
             sys.stdout.write('\r' + test_info)
-        with open(os.path.join(result_path, set_name + "_per_class_metrics.txt"), 'w') as f:
+        with open(os.path.join(result_path, set_name + "_per_class_metricsDeepLab.txt"), 'w') as f:
             f.write('classes:\n' + np.array2string(cls_names) + '\n')
             sys.stdout.write('classes:\n' + np.array2string(cls_names) + '\n')
             for k, v in metrics_v.items():
@@ -403,65 +435,16 @@ def test_only(dataloader, network, loss, epoch, set_name):
         if loss == 'ndvi':
             print("\nClass Activation Interval saved in:", result_path)
 
+input_channels = 13          
+resnet = 'resnet34_os8'    
+last_activation = 'softmax' 
 
-def compute_train_weights(train_loader):
-    beta = 0.9
-    samples_per_cls = torch.zeros(n_classes)
-    for batch_idx, data in enumerate(train_loader):
-        inputs, targets, _, _, _ = data
-        for cls in range(n_classes):
-            samples_per_cls[cls] += torch.sum(targets == cls)
-    max_occ = torch.max(samples_per_cls)
-    weights = torch.FloatTensor(max_occ / samples_per_cls)
-    # max_occ = torch.max(weights)
-    # weights = torch.FloatTensor(weights / max_occ)
-    if torch.cuda.is_available():
-        weights = weights.cuda()
-
-    return weights
-
-
-
-
-
-
-
-traindataset = SentinelDataset(root_path, tileids="tileids/train_fold0.tileids", seqlength=sample_duration)
-traindataloader = torch.utils.data.DataLoader(
-    traindataset, batch_size=batch_size, shuffle=True, num_workers=workers)
-# How to iterate on a dataloader
-for iteration, data in enumerate(traindataloader):
-    input, target, target_ndvi, _, _ = data
-    print('input temporal series with 30 images of size 13x48x48:', input.shape)
-    print('target segmentation image (batchx48x48):', target.shape)
-    print('target_ndvi containing 30 channels of size 48x48:', target_ndvi.shape)
-    break
-
-# Load test set
-testdataset = SentinelDataset(root_path, tileids="tileids/test_fold0.tileids", seqlength=sample_duration)
-testdataloader = torch.utils.data.DataLoader(
-    testdataset, batch_size=batch_size, shuffle=False, num_workers=workers)
-# Load validation set
-validationdataset = SentinelDataset(root_path, tileids="tileids/eval.tileids", seqlength=sample_duration)
-validationdataloader = torch.utils.data.DataLoader(
-    validationdataset, batch_size=batch_size, shuffle=False, num_workers=workers)
-
-
-numclasses = len(traindataset.classes)
-labels = list(range(numclasses))
-print(traindataset.classes)
-print(labels)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(device)
-
-model = UNet().cuda()
-
-
+model = DeepLabV3_3D(num_classes = 18, input_channels = input_channels, resnet = resnet, last_activation = last_activation).cuda()
 labels = list(range(numclasses))
 
 if torch.cuda.is_available():
     model = torch.nn.DataParallel(model).cuda()
+#model.cuda()
 if ottimizzatore == 'adam':
     optimizer = torch.optim.Adam(model.parameters(),
                                 lr=learning_rate,
