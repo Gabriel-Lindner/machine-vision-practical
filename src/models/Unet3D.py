@@ -54,7 +54,6 @@ class UNet(Module):
         x = torch.permute(x, (0,1,3,4,2))
         x = torch.nn.functional.pad(x,(0, 2), mode='constant', value=0.0)
         x = torch.permute(x, (0,1,4,3,2))
-        print(x.shape)
         x1 = self.conv_blk1(x)
 
         x_low1 = self.pool1(x1)
@@ -88,13 +87,16 @@ class UNet(Module):
         d_high1 = self.dec_conv_blk1(d1)
 
         conv_out = self.one_conv(d_high1)
+        print(conv_out.shape)
         # la sua shape è (b, 1, 32, 48, 48)
         # 1 è come avere [[v1,v2...]] che è equivalente a [v1,v2...]
         # possiamo eliminare la dimensione con il comando squeeze
         conv_out = conv_out.squeeze(1)
+        print(conv_out.shape)
         # (b, 32, 48, 48)
         # uso una conv per portarmi a (b, num_classes, 48, 48)
         out = self.final_conv(conv_out)
+        print(out.shape)
         seg = self.sigmoid(out)
 
         return seg

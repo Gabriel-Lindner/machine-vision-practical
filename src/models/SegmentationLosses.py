@@ -43,7 +43,9 @@ class SegmentationLosses(object):
         return loss_func
 
     def cross_entropy_loss(self, logit, target):
-        n, c, h, w = logit.size()
+        print(logit.shape)
+        print(target.shape)
+        n = logit.size()[0]
 
         loss = self.criterion_xent(logit, target.long())
 
